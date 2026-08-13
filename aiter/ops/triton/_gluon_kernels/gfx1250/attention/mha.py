@@ -16,6 +16,16 @@ def _cdiv_fn(x, y):
 
 
 @gluon.jit
+def _compute_fp8_scaling_factors(x, fp8_max: gl.constexpr):
+    # Mirrors utils/_triton/mha_kernel_utils.py::_compute_fp8_scaling_factors.
+    # abs() so negatives count; the clamp keeps an all-zero block from dividing
+    # by zero.
+    x_amax = gl.max(gl.abs(x))
+    x_amax = gl.where(x_amax <= 1e-9, 1e-9, x_amax)
+    return fp8_max / x_amax, x_amax / fp8_max
+
+
+@gluon.jit
 def _attn_fwd_inner(
     acc,
     l_i,
@@ -34,15 +44,32 @@ def _attn_fwd_inner(
     offs_m,
     offs_n,
     sm_scale,
+    alibi_slope,
+    sd_ptr,
+    stride_sd_m,
+    stride_sd_n,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
-    a_layout: gl.constexpr,
-    b_layout: gl.constexpr,
+    QK_LAYOUT: gl.constexpr,
+    PV_LAYOUT: gl.constexpr,
+    q_layout: gl.constexpr,
+    k_layout: gl.constexpr,
+    p_layout: gl.constexpr,
+    v_layout: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
     LAST: gl.constexpr = False,
+    q_pe=None,
+    k_pe_desc=None,
+    k_pe_smem=None,
+    BLOCK_DMODEL_PE: gl.constexpr = 0,
+    descale_q=1.0,
+    descale_k=1.0,
+    descale_v=1.0,
+    IS_FP8: gl.constexpr = False,
+    FP8_MAX: gl.constexpr = 0.0,
+    BLOCK_DMODEL_POW2: gl.constexpr = 0,
 ):
     """One phase of the KV loop over block indices ``[blk_lo, blk_hi)``.
 
@@ -61,8 +88,18 @@ def _attn_fwd_inner(
     load landed, giving a zero ``acc`` for a few workgroups) because the ops
     issued in that iteration are the ones being counted. Same reason
     ``unified_attention_2d.attention_loop_standard`` peels its last tile.
+
+    With a PE head dim there is a third stream (K_PE), issued between K and V,
+    so every count above shifts by one -- see ``ASYNC_OPS``. Issue order within
+    a block is always [K, K_PE, V] so that V, which is consumed last, is also
+    the last to be waited on.
     """
     RCP_LN2 = gl.constexpr(1.4426950408889634)
+    HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
+    # Async ops issued per block. All wait counts derive from this so the
+    # bookkeeping stays in one place (getting it wrong reads a half-written
+    # LDS buffer silently, with no fault).
+    ASYNC_OPS: gl.constexpr = 3 if HAS_PE else 2
 
     for j in range(blk_lo, blk_hi):
         start_n = j * BLOCK_N
@@ -70,28 +107,48 @@ def _attn_fwd_inner(
         if LAST:
             gl.amd.gfx1250.tdm.async_wait(0)
         else:
-            gl.amd.gfx1250.tdm.async_wait(1)
-        k = k_smem.index(buf).permute([1, 0]).load(layout=b_layout)
+            gl.amd.gfx1250.tdm.async_wait(ASYNC_OPS - 1)
+        k = k_smem.index(buf).permute([1, 0]).load(layout=k_layout)
+
+        if HAS_PE:
+            if not LAST:
+                gl.amd.gfx1250.tdm.async_wait(ASYNC_OPS - 2)
+            k_pe = k_pe_smem.index(buf).permute([1, 0]).load(layout=k_layout)
 
         if not LAST:
             gl.amd.gfx1250.tdm.async_load(
                 k_desc, [(j + 1) * BLOCK_N, 0], k_smem.index(1 - buf)
             )
+            if HAS_PE:
+                gl.amd.gfx1250.tdm.async_load(
+                    k_pe_desc, [(j + 1) * BLOCK_N, 0], k_pe_smem.index(1 - buf)
+                )
             gl.amd.gfx1250.tdm.async_load(
                 v_desc, [(j + 1) * BLOCK_N, 0], v_smem.index(1 - buf)
             )
 
         qk_scale = sm_scale * RCP_LN2
         # -- compute qk ----
-        qk = gl.amd.gfx1250.wmma(
-            q, k, gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=WMMA_LAYOUT)
-        )
-        qk = qk * qk_scale
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=QK_LAYOUT)
+        if HAS_PE:
+            # PE contribution accumulates first, matching the Triton kernel's
+            # dot order so the two agree to fp32 rounding.
+            qk = gl.amd.gfx1250.wmma(q_pe, k_pe, qk)
+        qk = gl.amd.gfx1250.wmma(q, k, qk)
+        # Relabel into the PV layout so the softmax, the mask and `acc` all
+        # share one layout. Only the instruction K dim differs between the two,
+        # which does not affect the [M, N] accumulator distribution -- hence
+        # trivial. The assert is the canary if that ever stops being true.
+        qk = gl.convert_layout(qk, PV_LAYOUT, assert_trivial=True)
+        if IS_FP8:
+            qk = qk * (qk_scale * descale_q * descale_k)
+        else:
+            qk = qk * qk_scale
 
         # ---- masking ----
         need_mask: gl.constexpr = MASK_STEPS or IS_CAUSAL or (SLIDING_WINDOW > 0)
         if need_mask:
-            mask = gl.full([BLOCK_M, BLOCK_N], 1, gl.int1, layout=WMMA_LAYOUT)
+            mask = gl.full([BLOCK_M, BLOCK_N], 1, gl.int1, layout=PV_LAYOUT)
             if MASK_STEPS:
                 # Partial trailing tile. Applied unconditionally in this phase:
                 # it is a no-op for full tiles and avoids a branch.
@@ -106,6 +163,19 @@ def _attn_fwd_inner(
                     (start_n + offs_n)[None, :] >= (q_adj[:, None] - SLIDING_WINDOW)
                 )
             qk = gl.where(mask, qk, float("-inf"))
+
+        if alibi_slope is not None:
+            # Distance from the diagonal, which stays bottom-right aligned when
+            # seqlen_q != seqlen_k (same alignment as the causal mask). The
+            # diagonal itself gets no penalty; it grows with distance.
+            # ``offs_m`` is already global; ``offs_n`` is tile-local.
+            relative_pos = (
+                offs_m[:, None] + seqlen_k - seqlen_q - (start_n + offs_n)[None, :]
+            )
+            alibi_block = -1 * alibi_slope * gl.abs(relative_pos)
+            # Added after the -inf masking: a finite bias leaves -inf intact.
+            qk += alibi_block * RCP_LN2
+
         # get max scores so far
         m_ij = gl.maximum(m_i, gl.max(qk, axis=1))
 
@@ -118,6 +188,21 @@ def _attn_fwd_inner(
             p = gl.where(mask, p, 0.0)
 
         l_ij = gl.sum(p, axis=1)
+
+        if sd_ptr is not None:
+            # NOTE: as in the Triton kernel, the score written here is not the
+            # final softmax numerator -- it is normalized against the running
+            # max at this block, which later blocks may raise. Kept identical
+            # so the two kernels produce the same tensor.
+            gl.store(
+                sd_ptr
+                + offs_m[:, None] * stride_sd_m
+                + (start_n + offs_n)[None, :] * stride_sd_n,
+                p,
+                mask=(offs_m < seqlen_q)[:, None]
+                & ((start_n + offs_n) < seqlen_k)[None, :],
+            )
+
         alpha = gl.exp2(m_i - m_ij)
         if SLIDING_WINDOW > 0:
             # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
@@ -130,11 +215,32 @@ def _attn_fwd_inner(
         m_i = m_ij
 
         if not LAST:
-            gl.amd.gfx1250.tdm.async_wait(2)
-        v = v_smem.index(buf).load(layout=b_layout)
+            gl.amd.gfx1250.tdm.async_wait(ASYNC_OPS)
+        v = v_smem.index(buf).load(layout=v_layout)
 
-        p = gl.convert_layout(p.to(v.dtype, fp_downcast_rounding="rtz"), a_layout)
-        acc = gl.amd.gfx1250.wmma(p, v, acc)
+        if IS_FP8:
+            # p is rescaled into the fp8 range per block, so the dot cannot
+            # accumulate into `acc` directly -- it runs into a fresh zero
+            # accumulator and the result is descaled before being added. Same
+            # shape as the Triton kernel's `acc += dot(...) * dp * dv`.
+            scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
+            p_fp8 = gl.convert_layout((p * scale_p).to(v.dtype), p_layout)
+            acc += (
+                gl.amd.gfx1250.wmma(
+                    p_fp8,
+                    v,
+                    gl.zeros(
+                        [BLOCK_M, BLOCK_DMODEL_POW2],
+                        dtype=gl.float32,
+                        layout=PV_LAYOUT,
+                    ),
+                )
+                * descale_p
+                * descale_v
+            )
+        else:
+            p = gl.convert_layout(p.to(v.dtype, fp_downcast_rounding="rtz"), p_layout)
+            acc = gl.amd.gfx1250.wmma(p, v, acc)
 
         buf = 1 - buf
 
@@ -235,13 +341,19 @@ def _attn_fwd(
 ):
     # ---- unsupported-feature gates (the caller must route these to Triton) ----
     gl.static_assert(not ENABLE_DROPOUT, "gluon MHA: dropout not supported")
-    gl.static_assert(not RETURN_SCORES, "gluon MHA: return_scores not supported")
-    gl.static_assert(not IS_FP8, "gluon MHA: fp8 not supported")
-    gl.static_assert(BLOCK_DMODEL_PE == 0, "gluon MHA: PE head dim not supported")
-    gl.static_assert(
-        BLOCK_DMODEL == BLOCK_DMODEL_POW2, "gluon MHA: padded head not supported"
-    )
     gl.static_assert(SWIZZLE == "default", "gluon MHA: only the default swizzle")
+
+    # Positional-encoding head dim: q/k carry BLOCK_DMODEL_PE extra columns
+    # after the first BLOCK_DMODEL, contributing a second QK dot. The wrapper
+    # guarantees both are exact powers of two when PE is in play, so PE and a
+    # padded head never coexist.
+    HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
+
+    # Head dim not a power of two: the tiles are BLOCK_DMODEL_POW2 wide and the
+    # trailing columns carry no data. Q is zero-masked at the load, K/V are
+    # zero-filled by the TDM descriptor bound (CDNA5 descriptors pad with zero),
+    # and the O store drops them again.
+    PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
     NUM_WARPS: gl.constexpr = gl.num_warps()
     WARP_SIZE: gl.constexpr = 32  # gfx1250 is wave32
@@ -281,6 +393,15 @@ def _attn_fwd(
         stride_lse_z = gl.cast(stride_lse_z_in, gl.int64)
         stride_lse_h = gl.cast(stride_lse_h_in, gl.int64)
         stride_lse_m = gl.cast(stride_lse_m_in, gl.int64)
+        stride_alibi_z = gl.cast(stride_alibi_z_in, gl.int64)
+        stride_alibi_h = gl.cast(stride_alibi_h_in, gl.int64)
+        stride_sd_z = gl.cast(stride_sd_z_in, gl.int64)
+        stride_sd_h = gl.cast(stride_sd_h_in, gl.int64)
+        stride_sd_m = gl.cast(stride_sd_m_in, gl.int64)
+        stride_sd_n = gl.cast(stride_sd_n_in, gl.int64)
+        stride_descale_q_z = gl.cast(stride_descale_q_z_in, gl.int64)
+        stride_descale_k_z = gl.cast(stride_descale_k_z_in, gl.int64)
+        stride_descale_v_z = gl.cast(stride_descale_v_z_in, gl.int64)
     else:
         stride_qz = stride_qz_in
         stride_qh = stride_qh_in
@@ -299,6 +420,15 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
+        stride_alibi_z = stride_alibi_z_in
+        stride_alibi_h = stride_alibi_h_in
+        stride_sd_z = stride_sd_z_in
+        stride_sd_h = stride_sd_h_in
+        stride_sd_m = stride_sd_m_in
+        stride_sd_n = stride_sd_n_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
 
     # ---- layouts: ONE mma layout, M-split, shared by QK and PV ----
     if NUM_WARPS == 1:
@@ -310,18 +440,37 @@ def _attn_fwd(
     else:
         warp_bases: gl.constexpr = [[1, 0], [2, 0], [4, 0]]
 
-    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+    # Two MMA layouts, one per dot. FP8 WMMA reduces a deeper K per instruction,
+    # and the two dots reduce over different extents -- QK over the head dim, PV
+    # over BLOCK_N -- so their instruction shapes can differ. In bf16 both are
+    # [16, 16, 32] and the pair collapses to a single layout, which is why the
+    # QK->PV relabel in the inner loop is a no-op there (and asserted as such).
+    K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
+    QK_INSTR_K: gl.constexpr = (128 if BLOCK_DMODEL_POW2 > 64 else 64) if IS_FP8 else 32
+    PV_INSTR_K: gl.constexpr = (128 if BLOCK_N > 64 else 64) if IS_FP8 else 32
+    QK_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, QK_INSTR_K],
         warp_bases=warp_bases,
     )
-    K_WIDTH: gl.constexpr = 8  # bf16
-    a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=WMMA_LAYOUT, k_width=K_WIDTH
+    PV_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        instr_shape=[16, 16, PV_INSTR_K],
+        warp_bases=warp_bases,
     )
-    b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH
+    q_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=QK_LAYOUT, k_width=K_WIDTH
+    )
+    k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=QK_LAYOUT, k_width=K_WIDTH
+    )
+    p_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=PV_LAYOUT, k_width=K_WIDTH
+    )
+    v_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=PV_LAYOUT, k_width=K_WIDTH
     )
 
     k_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -330,8 +479,13 @@ def _attn_fwd(
     v_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_DMODEL_POW2, 16]], [BLOCK_N, BLOCK_DMODEL_POW2], [1, 0]
     )
+    if HAS_PE:
+        # Same transposed-read padding as K, sized to the PE width.
+        k_pe_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_DMODEL_PE, 8]], [BLOCK_N, BLOCK_DMODEL_PE], [1, 0]
+        )
 
-    ELEMENT_SIZE: gl.constexpr = 16  # bf16; fp8 would be 8
+    ELEMENT_SIZE: gl.constexpr = 8 if IS_FP8 else 16  # bits per element
     MAX_LOAD: gl.constexpr = 128
     SIZE_PER_THREAD: gl.constexpr = MAX_LOAD // ELEMENT_SIZE
     HEAD_SIZE_DIV: gl.constexpr = BLOCK_DMODEL_POW2 // SIZE_PER_THREAD
@@ -370,9 +524,9 @@ def _attn_fwd(
         seqlen_q = SEQLEN_Q
         seqlen_k = SEQLEN_K
 
-    offs_m_mma = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
-    offs_n_mma = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
-    offs_d_mma = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, WMMA_LAYOUT))
+    offs_m_mma = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, PV_LAYOUT))
+    offs_n_mma = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, PV_LAYOUT))
+    offs_d_mma = gl.arange(0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(0, PV_LAYOUT))
     offs_m = start_m * BLOCK_M + offs_m_mma
 
     n_blocks = _cdiv_fn(seqlen_k, BLOCK_N)
@@ -411,9 +565,11 @@ def _attn_fwd(
             acc = gl.zeros(
                 [BLOCK_M, BLOCK_DMODEL_POW2],
                 dtype=out_ptr.type.element_ty,
-                layout=WMMA_LAYOUT,
+                layout=PV_LAYOUT,
             )
             out_mask = (offs_m < seqlen_q)[:, None]
+            if PADDED_HEAD:
+                out_mask = out_mask & (offs_d_mma < BLOCK_DMODEL)[None, :]
             gl.store(out_ptr + offs_out, acc, mask=out_mask)
 
             if softmax_lse_ptr is not None:
@@ -425,7 +581,7 @@ def _attn_fwd(
                 )
                 lse_mask = offs_m < SEQLEN_Q
                 lse = gl.full(
-                    [BLOCK_M], 0.0, gl.float32, gl.SliceLayout(1, WMMA_LAYOUT)
+                    [BLOCK_M], 0.0, gl.float32, gl.SliceLayout(1, PV_LAYOUT)
                 )
                 gl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
 
@@ -439,12 +595,41 @@ def _attn_fwd(
         + off_q_head * stride_qh
         + (cu_seqlens_q_start + start_m * BLOCK_M) * stride_qm
     )
+    q_mask = ((start_m * BLOCK_M + offs_m_q) < seqlen_q)[:, None]
+    if PADDED_HEAD:
+        q_mask = q_mask & (offs_d_q < BLOCK_DMODEL)[None, :]
     q = gl.load(
         q_ptr + q_base + offs_m_q[:, None] * stride_qm + offs_d_q[None, :] * stride_qk,
-        mask=((start_m * BLOCK_M + offs_m_q) < seqlen_q)[:, None],
+        mask=q_mask,
         other=0.0,
     )
-    q = gl.convert_layout(q, a_layout)
+    q = gl.convert_layout(q, q_layout)
+
+    if HAS_PE:
+        # The PE columns sit immediately after the BLOCK_DMODEL data columns of
+        # the same Q tensor, so this is one more strided load, not a new tensor.
+        PE_SIZE_DIV: gl.constexpr = BLOCK_DMODEL_PE // SIZE_PER_THREAD
+        blocked_q_pe: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, SIZE_PER_THREAD],
+            threads_per_warp=[WARP_SIZE // PE_SIZE_DIV, PE_SIZE_DIV],
+            warps_per_cta=[NUM_WARPS, 1],
+            order=[1, 0],
+        )
+        offs_m_q_pe = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_q_pe))
+        offs_pe = BLOCK_DMODEL + gl.arange(
+            0, BLOCK_DMODEL_PE, layout=gl.SliceLayout(0, blocked_q_pe)
+        )
+        q_pe = gl.load(
+            q_ptr
+            + q_base
+            + offs_m_q_pe[:, None] * stride_qm
+            + offs_pe[None, :] * stride_qk,
+            mask=((start_m * BLOCK_M + offs_m_q_pe) < seqlen_q)[:, None],
+            other=0.0,
+        )
+        q_pe = gl.convert_layout(q_pe, q_layout)
+    else:
+        q_pe = None
 
     # ---- K/V: TDM descriptors bounded by this sequence's length ----
     # The per-sequence `shape` bound removes the OOB row mask from the loads;
@@ -452,16 +637,19 @@ def _attn_fwd(
     # scores anyway. Requires the head-dim stride to be 1 (checked by caller).
     k_base = off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
     v_base = off_z * stride_vz + off_k_head * stride_vh + cu_seqlens_k_start * stride_vn
+    # `shape` is the real extent in both axes: rows past seqlen_k and columns
+    # past BLOCK_DMODEL are zero-filled by the descriptor, which is what makes
+    # the OOB row mask and the padded-head column mask unnecessary here.
     k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr + k_base,
-        shape=[seqlen_k, BLOCK_DMODEL_POW2],
+        shape=[seqlen_k, BLOCK_DMODEL],
         strides=[stride_kn, 1],
         block_shape=[BLOCK_N, BLOCK_DMODEL_POW2],
         layout=k_shared,
     )
     v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr + v_base,
-        shape=[seqlen_k, BLOCK_DMODEL_POW2],
+        shape=[seqlen_k, BLOCK_DMODEL],
         strides=[stride_vn, 1],
         block_shape=[BLOCK_N, BLOCK_DMODEL_POW2],
         layout=v_shared,
@@ -472,6 +660,22 @@ def _attn_fwd(
     v_smem = gl.allocate_shared_memory(
         v_ptr.type.element_ty, [2, BLOCK_N, BLOCK_DMODEL_POW2], v_shared
     )
+    if HAS_PE:
+        # +BLOCK_DMODEL on the base walks past the data columns; the head-dim
+        # stride is 1 (enforced by the caller), so this is a plain element skip.
+        k_pe_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=k_ptr + k_base + BLOCK_DMODEL,
+            shape=[seqlen_k, BLOCK_DMODEL_PE],
+            strides=[stride_kn, 1],
+            block_shape=[BLOCK_N, BLOCK_DMODEL_PE],
+            layout=k_pe_shared,
+        )
+        k_pe_smem = gl.allocate_shared_memory(
+            k_ptr.type.element_ty, [2, BLOCK_N, BLOCK_DMODEL_PE], k_pe_shared
+        )
+    else:
+        k_pe_desc = None
+        k_pe_smem = None
 
     # ---- accumulators ----
     if ENABLE_SINK:
@@ -480,12 +684,36 @@ def _attn_fwd(
     else:
         m_i_value = float("-inf")
     m_i = gl.full(
-        [BLOCK_M], m_i_value, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        [BLOCK_M], m_i_value, dtype=gl.float32, layout=gl.SliceLayout(1, PV_LAYOUT)
     )
     l_i = gl.full(
-        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, PV_LAYOUT)
     )
-    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=WMMA_LAYOUT)
+    acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=PV_LAYOUT)
+
+    # ---- fp8 per-tensor descale factors ----
+    if IS_FP8:
+        descale_q = gl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
+        descale_k = gl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
+        descale_v = gl.load(descale_v_ptr + off_z * stride_descale_v_z + off_k_head)
+    else:
+        descale_q = 1.0
+        descale_k = 1.0
+        descale_v = 1.0
+
+    # ---- s_dmask (return_scores): base pointer for this (batch, q head) ----
+    if RETURN_SCORES:
+        sd_ptr = s_dmask_ptr + off_z * stride_sd_z + off_q_head * stride_sd_h
+    else:
+        sd_ptr = None
+
+    # ---- alibi: one scalar slope per (batch, q head) ----
+    if alibi_slopes_ptr is not None:
+        alibi_slope = gl.load(
+            alibi_slopes_ptr + off_z * stride_alibi_z + off_q_head * stride_alibi_h
+        )
+    else:
+        alibi_slope = None
 
     # ---- full / masked block split (mirrors _attn_fwd) ----
     n_extra_tokens = 0
@@ -517,10 +745,14 @@ def _attn_fwd(
     masked_blocks = gl.minimum(masked_blocks, visible_blocks)
     n_full_blocks = visible_blocks - masked_blocks
 
-    # Prime the pipeline
+    # Prime the pipeline. Issue order [K, K_PE, V] must match the loop body's.
     gl.amd.gfx1250.tdm.async_load(
         k_desc, [skipped_blocks * BLOCK_N, 0], k_smem.index(0)
     )
+    if HAS_PE:
+        gl.amd.gfx1250.tdm.async_load(
+            k_pe_desc, [skipped_blocks * BLOCK_N, 0], k_pe_smem.index(0)
+        )
     gl.amd.gfx1250.tdm.async_load(
         v_desc, [skipped_blocks * BLOCK_N, 0], v_smem.index(0)
     )
@@ -555,14 +787,31 @@ def _attn_fwd(
                 offs_m,
                 offs_n_mma,
                 sm_scale,
+                alibi_slope,
+                sd_ptr,
+                stride_sd_m,
+                stride_sd_n,
                 BLOCK_M,
                 BLOCK_N,
-                WMMA_LAYOUT,
-                a_layout,
-                b_layout,
+                QK_LAYOUT,
+                PV_LAYOUT,
+                q_layout,
+                k_layout,
+                p_layout,
+                v_layout,
                 IS_CAUSAL=False,
                 MASK_STEPS=False,
                 SLIDING_WINDOW=SLIDING_WINDOW,
+                q_pe=q_pe,
+                k_pe_desc=k_pe_desc,
+                k_pe_smem=k_pe_smem,
+                BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
+                descale_q=descale_q,
+                descale_k=descale_k,
+                descale_v=descale_v,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             )
 
         if last_blk > end_full:
@@ -584,14 +833,31 @@ def _attn_fwd(
                 offs_m,
                 offs_n_mma,
                 sm_scale,
+                alibi_slope,
+                sd_ptr,
+                stride_sd_m,
+                stride_sd_n,
                 BLOCK_M,
                 BLOCK_N,
-                WMMA_LAYOUT,
-                a_layout,
-                b_layout,
+                QK_LAYOUT,
+                PV_LAYOUT,
+                q_layout,
+                k_layout,
+                p_layout,
+                v_layout,
                 IS_CAUSAL=IS_CAUSAL,
                 MASK_STEPS=True,
                 SLIDING_WINDOW=SLIDING_WINDOW,
+                q_pe=q_pe,
+                k_pe_desc=k_pe_desc,
+                k_pe_smem=k_pe_smem,
+                BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
+                descale_q=descale_q,
+                descale_k=descale_k,
+                descale_v=descale_v,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             )
 
         acc, l_i, m_i, buf = _attn_fwd_inner(
@@ -612,15 +878,32 @@ def _attn_fwd(
             offs_m,
             offs_n_mma,
             sm_scale,
+            alibi_slope,
+            sd_ptr,
+            stride_sd_m,
+            stride_sd_n,
             BLOCK_M,
             BLOCK_N,
-            WMMA_LAYOUT,
-            a_layout,
-            b_layout,
+            QK_LAYOUT,
+            PV_LAYOUT,
+            q_layout,
+            k_layout,
+            p_layout,
+            v_layout,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
             SLIDING_WINDOW=SLIDING_WINDOW,
             LAST=True,
+            q_pe=q_pe,
+            k_pe_desc=k_pe_desc,
+            k_pe_smem=k_pe_smem,
+            BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
         )
 
     gl.amd.gfx1250.tdm.async_wait(0)
@@ -661,8 +944,11 @@ def _attn_fwd(
         + offs_m[:, None] * stride_om
         + offs_d_mma[None, :] * stride_on
     )
+    out_mask = (offs_m < seqlen_q)[:, None]
+    if PADDED_HEAD:
+        out_mask = out_mask & (offs_d_mma < BLOCK_DMODEL)[None, :]
     gl.store(
         out_ptr + offs_out,
         acc.to(out_ptr.type.element_ty),
-        mask=(offs_m < seqlen_q)[:, None],
+        mask=out_mask,
     )
