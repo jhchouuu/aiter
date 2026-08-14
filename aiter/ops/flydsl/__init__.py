@@ -39,22 +39,25 @@ if is_flydsl_available():
 
     from .fmha_kernels import flydsl_flash_attn_func
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
-    from .kernels.fp8_mqa_logits import (
+    from .kernels.mqa_logits.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
-    from .kernels.fp8_mqa_logits import (
+    from .kernels.mqa_logits.fp8_mqa_logits import (
         KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
     )
-    from .kernels.fp8_mqa_logits import (
+    from .kernels.mqa_logits.fp8_mqa_logits import (
         flydsl_fp8_mqa_logits,
     )
-    from .kernels.pa_mqa_logits_fp4 import (
+    from .kernels.mqa_logits.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
-    from .kernels.pa_mqa_logits_fp4_prefill import (
+    from .kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compute_varqlen_windows,
         flydsl_pa_mqa_logits_fp4_prefill,
+        flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .pa_decode import pa_decode
 
@@ -63,13 +66,16 @@ if is_flydsl_available():
     __all__ += [
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
+        "compute_varqlen_windows",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
         "pa_decode",
