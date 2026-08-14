@@ -16,8 +16,7 @@ name: PR Title Tags
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
-
+    types: [opened, ready_for_review, synchronize, reopened]
 permissions:
   pull-requests: write
 
